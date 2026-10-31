@@ -1,0 +1,30 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Caption Sync</title>
+<style>
+body{font:15px system-ui;max-width:900px;margin:24px auto;padding:0 16px;color:#222}
+fieldset{margin:12px 0;border:1px solid #ccc;border-radius:8px}
+label{display:block;margin:6px 0}
+input[type=number]{width:70px}
+button{padding:8px 14px;margin-right:8px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{border-bottom:1px solid #ddd;padding:3px;text-align:left}
+#log{white-space:pre-wrap;background:#f4f4f4;padding:8px;border-radius:6px;max-height:160px;overflow:auto;font-size:12px}
+</style></head><body>
+<h2>Caption ↔ Audio Sync</h2>
+<fieldset><legend>1. Files</legend>
+<label>Video (with captions) <input type="file" id="video" accept="video/*"></label>
+<label>Audio file(s), in order <input type="file" id="audio" accept="audio/*" multiple></label>
+<label>OpenAI API key (stays in your browser) <input type="password" id="key" size="40"></label>
+</fieldset>
+<fieldset><legend>2. Settings</legend>
+<label>OCR language <input id="lang" value="eng" size="6"> &nbsp;OCR samples/sec <input type="number" id="sps" value="2" min="1" max="8"></label>
+<label>Min speed <input type="number" id="minS" value="0.6" step="0.1"> Max speed <input type="number" id="maxS" value="2" step="0.1"> (limits per scene)</label>
+<label>If a scene is still too short after slowing, fill with
+<select id="pad"><option value="freeze">frozen last frame</option><option value="black">blank screen</option><option value="image">my image</option></select>
+<input type="file" id="img" accept="image/*"></label>
+<label>If still too long after max speed-up, the extra video is trimmed.</label>
+</fieldset>
+<button id="analyze">3. Analyze</button><button id="render" disabled>5. Render</button>
+<fieldset><legend>4. Review scenes (editable)</legend><table id="tbl"></table></fieldset>
+<video id="out" controls style="width:100%"></video><a id="dl" download="synced.mp4">Download</a>
+<div id="log"></div>
+<script type="module" src="/src/main.js"></script></body></html>
