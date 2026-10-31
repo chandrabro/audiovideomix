@@ -20,6 +20,30 @@ async function getFF() {
   return ff;
 }
 
+// ---------- SRT helpers ----------
+const ts = t => { const m = t.trim().match(/(\d+):(\d+):(\d+)[,.](\d+)/); return +m[1] * 3600 + +m[2] * 60 + +m[3] + +('0.' + m[4]); };
+function parseSrt(txt) {
+  return txt.replace(/\r/g, '').trim().split(/\n\s*\n/).map(b => {
+    const l = b.split('\n'), i = l.findIndex(x => x.includes('-->'));
+    if (i < 0) return null;
+    const [a, c] = l[i].split('-->');
+    return { s: ts(a), e: ts(c), text: norm(l.slice(i + 1).join(' ').replace(/<[^>]+>/g, ' ')) };
+  }).filter(x => x && x.text);
+}
+const meta = file => new Promise(r => {
+  const v = document.createElement('video'); v.preload = 'metadata';
+  v.onloadedmetadata = () => r({ dur: v.duration, w: v.videoWidth, h: v.videoHeight });
+  v.src = URL.createObjectURL(file);
+});
+// video SRT -> scenes (each cue starts a scene; scenes are contiguous)
+const scenesFromSrt = (k, dur) => k.map((c, i) => ({ vs: i ? c.s : 0, text: c.text, ve: Math.min(k[i + 1] ? k[i + 1].s : dur, dur) }));
+// audio SRT -> words with estimated times (spread evenly across each cue)
+function wordsFromSrt(k) {
+  const words = [];
+  k.forEach(c => { const ws = c.text.split(' '), d = (c.e - c.s) / ws.length; ws.forEach((w, i) => words.push({ w, s: c.s + i * d })); });
+  return words;
+}
+
 // ---------- 1. OCR the captions ----------
 const seek = (v, t) => new Promise(r => { v.onseeked = () => r(); v.currentTime = Math.max(t, 0.001); });
 
@@ -132,16 +156,32 @@ $('tbl').onchange = e => { segs[e.target.dataset.i][e.target.dataset.k] = +e.tar
 
 $('analyze').onclick = async () => {
   try {
-    const vf = $('video').files[0], af = [...$('audio').files];
-    if (!vf || !af.length || !$('key').value) return alert('Add a video, audio file(s) and your OpenAI key.');
+    const vf = $('video').files[0], af = [...$('audio').files], vsrt = $('vsrt').files[0], asrt = $('asrt').files[0];
+    if (!vf || !af.length) return alert('Add a video and audio file(s).');
+    if (!asrt && !$('key').value) return alert('Add your OpenAI key, or upload an audio SRT instead.');
     $('log').textContent = ''; $('render').disabled = true;
-    const step = 1 / +$('sps').value;
-    log('Reading captions (OCR)…');
-    vinfo = await readCaptions(vf, step);
-    segs = group(vinfo.rows, step, vinfo.dur);
-    log(`${segs.length} caption scenes found. Transcribing audio…`);
-    const tr = await transcribe(af); atotal = tr.total;
-    align(segs, tr.words); draw();
+    if (vsrt) {
+      log('Using video SRT (skipping OCR)…');
+      const m = await meta(vf); vinfo = m;
+      segs = scenesFromSrt(parseSrt(await vsrt.text()), m.dur);
+    } else {
+      const step = 1 / +$('sps').value;
+      log('Reading captions (OCR)…');
+      vinfo = await readCaptions(vf, step);
+      segs = group(vinfo.rows, step, vinfo.dur);
+    }
+    log(`${segs.length} caption scenes.`);
+    let words;
+    if (asrt) {
+      log('Using audio SRT (skipping transcription)…');
+      atotal = 0; for (const f of af) atotal += (await meta(f)).dur;
+      words = wordsFromSrt(parseSrt(await asrt.text()));
+    } else {
+      log('Transcribing audio…');
+      const tr = await transcribe(af); atotal = tr.total; words = tr.words;
+    }
+    if (!segs.length || !words.length) throw new Error('No captions or no spoken words found.');
+    align(segs, words); draw();
     $('render').disabled = false; log('Review the table (fix anything marked ⚠), then Render.');
   } catch (e) { log('ERROR: ' + e.message); }
 };

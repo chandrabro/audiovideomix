@@ -13,7 +13,9 @@ td,th{border-bottom:1px solid #ddd;padding:3px;text-align:left}
 <fieldset><legend>1. Files</legend>
 <label>Video (with captions) <input type="file" id="video" accept="video/*"></label>
 <label>Audio file(s), in order <input type="file" id="audio" accept="audio/*" multiple></label>
-<label>OpenAI API key (stays in your browser) <input type="password" id="key" size="40"></label>
+<label>Video SRT <small>(optional: skips caption OCR)</small> <input type="file" id="vsrt" accept=".srt"></label>
+<label>Audio SRT <small>(optional: skips transcription; one SRT covering all audio files in order)</small> <input type="file" id="asrt" accept=".srt"></label>
+<label>OpenAI API key <small>(only needed without an audio SRT; stays in your browser)</small> <input type="password" id="key" size="40"></label>
 </fieldset>
 <fieldset><legend>2. Settings</legend>
 <label>OCR language <input id="lang" value="eng" size="6"> &nbsp;OCR samples/sec <input type="number" id="sps" value="2" min="1" max="8"></label>
