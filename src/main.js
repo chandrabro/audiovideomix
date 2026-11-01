@@ -8,7 +8,7 @@ const esc = s => s.replace(/[&<>"]/g, c => '&#' + c.charCodeAt(0) + ';');
 const norm = t => t.toLowerCase().replace(/[^\p{L}\p{M}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
 let ff, segs = [], vinfo, atotal = 0, busy = false, ready = false, tail = [];
 const fail = e => { log('ERROR: ' + (e && e.message ? e.message : String(e))); console.error(e); if (ff) { try { ff.terminate(); } catch {} ff = null; } };
-const run = async (f, a) => { tail = []; const c = await run(f, a); if (c !== 0) throw new Error(`ffmpeg exit ${c}: ${tail.slice(-4).join(' | ')}`); };
+const run = async (f, a) => { tail = []; const c = await f.exec(a); if (c !== 0) throw new Error(`ffmpeg exit ${c}: ${tail.slice(-4).join(' | ')}`); };
 
 async function mountVideo(file) {
   const f = await getFF();
