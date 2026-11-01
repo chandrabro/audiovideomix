@@ -5,13 +5,23 @@ import Tesseract from 'tesseract.js';
 const $ = id => document.getElementById(id);
 const log = m => { $('log').textContent += m + '\n'; $('log').scrollTop = 1e9; };
 const esc = s => s.replace(/[&<>"]/g, c => '&#' + c.charCodeAt(0) + ';');
-const norm = t => t.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
-let ff, segs = [], vinfo, atotal = 0;
+const norm = t => t.toLowerCase().replace(/[^\p{L}\p{M}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+let ff, segs = [], vinfo, atotal = 0, busy = false, ready = false, tail = [];
+const fail = e => { log('ERROR: ' + (e && e.message ? e.message : String(e))); console.error(e); if (ff) { try { ff.terminate(); } catch {} ff = null; } };
+const run = async (f, a) => { tail = []; const c = await run(f, a); if (c !== 0) throw new Error(`ffmpeg exit ${c}: ${tail.slice(-4).join(' | ')}`); };
+
+async function mountVideo(file) {
+  const f = await getFF();
+  try { await f.createDir('/data'); } catch {}
+  try { await f.unmount('/data'); } catch {}
+  await f.mount('WORKERFS', { files: [file] }, '/data');
+  return '/data/' + file.name;
+}
 
 async function getFF() {
   if (ff) return ff;
   ff = new FFmpeg();
-  ff.on('log', ({ message }) => { if (/error|invalid/i.test(message)) log(message); });
+  ff.on('log', ({ message }) => { tail.push(message); if (/error|invalid/i.test(message)) log(message); });
   const base = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
   await ff.load({
     coreURL: await toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
@@ -99,11 +109,11 @@ async function buildAudio(files, args, ext, out) {
   const f = await getFF(), names = [];
   for (let i = 0; i < files.length; i++) {
     await f.writeFile('a' + i, await fetchFile(files[i]));
-    await f.exec(['-i', 'a' + i, '-vn', ...args, `${out}${i}.${ext}`]);
+    await run(f, ['-i', 'a' + i, '-vn', ...args, `${out}${i}.${ext}`]);
     names.push(`${out}${i}.${ext}`);
   }
   await f.writeFile(out + '.txt', names.map(n => `file '${n}'`).join('\n'));
-  await f.exec(['-f', 'concat', '-safe', '0', '-i', out + '.txt', '-c', 'copy', `${out}.${ext}`]);
+  await run(f, ['-f', 'concat', '-safe', '0', '-i', out + '.txt', '-c', 'copy', `${out}.${ext}`]);
   return f.readFile(`${out}.${ext}`);
 }
 
@@ -155,6 +165,7 @@ function draw() {
 $('tbl').onchange = e => { segs[e.target.dataset.i][e.target.dataset.k] = +e.target.value; draw(); };
 
 $('analyze').onclick = async () => {
+  ready = false;
   try {
     const vf = $('video').files[0], af = [...$('audio').files], vsrt = $('vsrt').files[0], asrt = $('asrt').files[0];
     if (!vf || !af.length) return alert('Add a video and audio file(s).');
@@ -175,15 +186,16 @@ $('analyze').onclick = async () => {
     if (asrt) {
       log('Using audio SRT (skipping transcription)…');
       atotal = 0; for (const f of af) atotal += (await meta(f)).dur;
-      words = wordsFromSrt(parseSrt(await asrt.text()));
+      const cues = parseSrt(await asrt.text()); words = wordsFromSrt(cues);
+      if (cues.length) atotal = Math.max(atotal, cues[cues.length - 1].e);
     } else {
       log('Transcribing audio…');
       const tr = await transcribe(af); atotal = tr.total; words = tr.words;
     }
     if (!segs.length || !words.length) throw new Error('No captions or no spoken words found.');
     align(segs, words); draw();
-    $('render').disabled = false; log('Review the table (fix anything marked ⚠), then Render.');
-  } catch (e) { log('ERROR: ' + e.message); }
+    ready = true; log('Review the table (fix anything marked ⚠), then Render.');
+  } catch (e) { fail(e); }
 };
 
 // ---------- 4. Render: per-scene speed change, hard cuts ----------
@@ -191,7 +203,7 @@ $('render').onclick = async () => {
   try {
     const f = await getFF(), { w, h } = vinfo, [mn, mx] = lim(), mode = $('pad').value, FPS = 30;
     const w2 = w - (w % 2), h2 = h - (h % 2);
-    await f.writeFile('in.vid', await fetchFile($('video').files[0]));
+    const inp = await mountVideo($('video').files[0]);
     if (mode === 'image' && $('img').files[0]) await f.writeFile('img', await fetchFile($('img').files[0]));
     const list = [];
     for (let i = 0; i < segs.length; i++) {
@@ -200,11 +212,11 @@ $('render').onclick = async () => {
       let vf = `setpts=PTS/${sp},fps=${FPS},scale=${w2}:${h2},setsar=1`;
       if (gap > 0.04 && mode === 'freeze') vf += `,tpad=stop_mode=clone:stop_duration=${gap}`;
       if (gap > 0.04 && mode === 'black') vf += `,tpad=stop_mode=add:stop_duration=${gap}:color=black`;
-      await f.exec(['-ss', String(s.vs), '-t', String(vd), '-i', 'in.vid', '-vf', vf, '-an', '-t', String(td),
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-r', String(FPS), `s${i}.mp4`]);
+      await run(f, ['-ss', String(s.vs), '-t', String(vd), '-i', inp, '-vf', vf, '-an', '-t', String(td),
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-pix_fmt', 'yuv420p', '-r', String(FPS), `s${i}.mp4`]);
       list.push(`s${i}.mp4`);
       if (gap > 0.04 && mode === 'image' && $('img').files[0]) {
-        await f.exec(['-loop', '1', '-i', 'img', '-t', String(gap), '-vf',
+        await run(f, ['-loop', '1', '-i', 'img', '-t', String(gap), '-vf',
           `scale=${w2}:${h2}:force_original_aspect_ratio=decrease,pad=${w2}:${h2}:(ow-iw)/2:(oh-ih)/2,fps=${FPS},setsar=1`,
           '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', `p${i}.mp4`]);
         list.push(`p${i}.mp4`);
@@ -212,11 +224,20 @@ $('render').onclick = async () => {
       log(`Scene ${i + 1}/${segs.length}: ${sp.toFixed(2)}x${gap > 0.04 ? ', +' + gap.toFixed(1) + 's fill' : ''}`);
     }
     await f.writeFile('v.txt', list.map(n => `file '${n}'`).join('\n'));
-    await f.exec(['-f', 'concat', '-safe', '0', '-i', 'v.txt', '-c', 'copy', 'video.mp4']);
+    await run(f, ['-f', 'concat', '-safe', '0', '-i', 'v.txt', '-c', 'copy', 'video.mp4']);
     log('Mixing audio…');
     await buildAudio([...$('audio').files], ['-ar', '44100', '-ac', '2', '-b:a', '160k'], 'm4a', 'h');
-    await f.exec(['-i', 'video.mp4', '-i', 'h.m4a', '-map', '0:v', '-map', '1:a', '-c', 'copy', '-shortest', 'out.mp4']);
+    await run(f, ['-i', 'video.mp4', '-i', 'h.m4a', '-map', '0:v', '-map', '1:a', '-c', 'copy', '-shortest', 'out.mp4']);
     const url = URL.createObjectURL(new Blob([await f.readFile('out.mp4')], { type: 'video/mp4' }));
+    for (const n of list) { try { await f.deleteFile(n); } catch {} }
     $('out').src = url; $('dl').href = url; log('Done.');
-  } catch (e) { log('ERROR: ' + e.message); }
+  } catch (e) { fail(e); }
 };
+
+// one job at a time: ffmpeg.wasm can't run two jobs on the same instance
+const once = fn => async () => {
+  if (busy) return; busy = true; $('analyze').disabled = $('render').disabled = true;
+  try { await fn(); } finally { busy = false; $('analyze').disabled = false; $('render').disabled = !ready; }
+};
+$('analyze').onclick = once($('analyze').onclick);
+$('render').onclick = once($('render').onclick);
