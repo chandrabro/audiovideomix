@@ -9,4 +9,5 @@ each caption scene is aligned to its spoken line, and every scene is sped up / s
 ## Notes
 - Everything runs in the browser (ffmpeg.wasm + Tesseract.js). Optional SRT uploads skip OCR (video SRT) and transcription (audio SRT, no key needed). Otherwise your OpenAI key is typed into the page and sent only to OpenAI.
 - Best for videos up to a few minutes / a few hundred MB. For longer videos, move the render step to a server worker.
+- Audio timing is free by default: the app finds pauses in your audio and snaps the audio-SRT lines to them. The OpenAI/Whisper option is optional.
 - Run locally: `npm install && npm run dev`

@@ -205,6 +205,71 @@ function align(segs, words) {
   return hit.reduce((a, b) => a + b, 0) / Math.max(V.length, 1);
 }
 
+// FREE timing: find pauses in the audio with ffmpeg, then snap the audio-SRT line breaks to those pauses
+async function findPauses(files, db) {
+  const f = await getFF();
+  await buildAudio(files, ['-ac', '1', '-ar', '16000', '-b:a', '32k'], 'mp3', 'w');
+  const dur = await probe(f, 'w.mp3');
+  await run(f, ['-i', 'w.mp3', '-af', `silencedetect=noise=${db}dB:d=0.3`, '-f', 'null', '-']);
+  const gaps = []; let st = null;
+  for (const m of tail) {
+    const a = m.match(/silence_start:\s*(-?[\d.]+)/), b = m.match(/silence_end:\s*([\d.]+)/);
+    if (a) st = Math.max(0, +a[1]);
+    if (b && st !== null) { gaps.push({ s: st, e: +b[1] }); st = null; }
+  }
+  return { gaps, dur };
+}
+
+function retimeByPauses(cues, gaps, total) {
+  const n = cues.length; if (n < 2) return null;
+  let t0 = 0, tEnd = total; gaps = gaps.filter(g => g.e > g.s);
+  if (gaps.length && gaps[0].s < 0.1) { t0 = gaps[0].e; gaps = gaps.slice(1); }
+  if (gaps.length && gaps[gaps.length - 1].e >= total - 0.1) { tEnd = gaps[gaps.length - 1].s; gaps = gaps.slice(0, -1); }
+  const G = gaps.length, K = n - 1; if (G < K) return null;
+  let lost = 0;
+  const sb = gaps.map(g => { const x = g.s - t0 - lost; lost += g.e - g.s; return x; }); // speech time before each pause
+  const speech = tEnd - t0 - lost;
+  const wc = cues.map(c => c.text.split(' ').length), rate = speech / wc.reduce((a, b) => a + b, 0);
+  // a line's speech time should be close to (its word count x average time per word); pauses between lines are preferred long
+  const cc = (k, x) => Math.abs(Math.log(Math.max(x, 0.05) / (wc[k] * rate)));
+  const gc = g => -0.15 * Math.min(gaps[g].e - gaps[g].s, 1.5) / 1.5;
+  const dp = Array.from({ length: K }, () => new Float64Array(G).fill(Infinity)), bk = Array.from({ length: K }, () => new Int32Array(G).fill(-1));
+  for (let g = 0; g < G; g++) dp[0][g] = cc(0, sb[g]) + gc(g);
+  for (let k = 1; k < K; k++)
+    for (let g = k; g < G; g++) {
+      let best = Infinity, bi = -1;
+      for (let h = k - 1; h < g; h++) { const v = dp[k - 1][h] + cc(k, sb[g] - sb[h]); if (v < best) { best = v; bi = h; } }
+      if (bi >= 0) { dp[k][g] = best + gc(g); bk[k][g] = bi; }
+    }
+  let g = -1, bv = Infinity;
+  for (let i = 0; i < G; i++) { const v = dp[K - 1][i] + cc(n - 1, speech - sb[i]); if (v < bv) { bv = v; g = i; } }
+  if (g < 0) return null;
+  const sel = new Array(K); sel[K - 1] = g;
+  for (let k = K - 1; k > 0; k--) sel[k - 1] = bk[k][sel[k]];
+  const starts = [t0, ...sel.map(i => gaps[i].e)], ends = [...sel.map(i => gaps[i].s), tEnd];
+  const words = [];
+  cues.forEach((c, k) => { const ws = c.text.split(' '), d = (ends[k] - starts[k]) / ws.length; ws.forEach((w, i) => words.push({ w, s: starts[k] + i * d })); });
+  return { words, starts };
+}
+
+// Re-time the audio-SRT words using real word times from Whisper (SRT times are often only approximate)
+function retime(sw, ww) {
+  const m = dpAlign(sw.map(x => x.w), ww.map(x => x.w)), anc = [];
+  m.forEach((j, k) => { if (j >= 0) anc.push([k, ww[j].s]); });
+  const frac = anc.length / Math.max(sw.length, 1);
+  if (anc.length < Math.max(5, 0.1 * sw.length)) return { words: sw, frac };
+  let p = 0;
+  const words = sw.map((x, k) => {
+    while (p + 1 < anc.length && anc[p + 1][0] <= k) p++;
+    const a = anc[p], b = anc[p + 1];
+    const t = k <= anc[0][0] ? anc[0][1] - (anc[0][0] - k) * 0.35
+      : !b ? a[1] + (k - a[0]) * 0.35
+      : a[1] + (k - a[0]) / (b[0] - a[0]) * (b[1] - a[1]);
+    return { w: x.w, s: Math.max(0, t) };
+  });
+  return { words, frac };
+}
+
 const aEnd = i => segs[i + 1] ? segs[i + 1].as : atotal;
 const lim = () => [+$('minS').value, +$('maxS').value];
 
@@ -240,10 +305,24 @@ $('analyze').onclick = async () => {
     log(`${segs.length} caption scenes.`);
     let words;
     if (asrt) {
-      log('Using audio SRT (skipping transcription)…');
+      log('Using audio SRT text…');
       atotal = 0; for (const f of af) atotal += (await meta(f)).dur;
       const cues = parseSrt(await asrt.text()); words = wordsFromSrt(cues);
       if (cues.length) atotal = Math.max(atotal, cues[cues.length - 1].e);
+      const tm = $('tm').value;
+      if (tm === 'whisper') {
+        if (!$('key').value.trim()) throw new Error('Whisper timing needs your OpenAI key.');
+        log('Measuring real audio timing with Whisper (SRT times may be approximate)…');
+        const tr = await transcribe(af), r = retime(words, tr.words);
+        words = r.words; atotal = tr.total;
+        log(`Whisper timing matched ${Math.round(r.frac * 100)}% of the SRT words` + (r.frac < 0.3 ? ' (too low, keeping the SRT times).' : '.'));
+      } else if (tm === 'free') {
+        log('Detecting pauses in the audio to measure the real timing (free)…');
+        const { gaps, dur } = await findPauses(af, +$('db').value || -35);
+        const r = dur > 0 ? retimeByPauses(cues, gaps, dur) : null;
+        if (r) { words = r.words; atotal = dur; log(`Found ${gaps.length} pauses and placed ${cues.length} lines on them.`); }
+        else log(`Only ${gaps.length} pauses found for ${cues.length} lines, so the SRT times are kept. Try a higher dB value (for example -30).`);
+      } else log('Using the SRT times exactly as given.');
     } else {
       log('Transcribing audio…');
       const tr = await transcribe(af); atotal = tr.total; words = tr.words;
@@ -252,6 +331,7 @@ $('analyze').onclick = async () => {
     awords = words;
     const frac = align(segs, words); draw();
     log(`Matched ${Math.round(frac * 100)}% of caption words to the audio.` + (frac < 0.4 ? ' LOW: the two texts differ a lot, so check every ⚠ row.' : ''));
+    if (frac < 0.15) { log('STOP: the audio text and the video captions are almost completely different (probably the wrong audio SRT or audio file). Upload the matching audio SRT and click Analyze again.'); return; }
     ready = true; log('Review the table (fix anything marked ⚠), then Render.');
   } catch (e) { fail(e); }
 };

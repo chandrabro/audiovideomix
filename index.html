@@ -15,11 +15,12 @@ td,th{border-bottom:1px solid #ddd;padding:3px;text-align:left}
 <label>Audio file(s), in order <input type="file" id="audio" accept="audio/*" multiple></label>
 <label>Video SRT <small>(optional: skips caption OCR)</small> <input type="file" id="vsrt" accept=".srt"></label>
 <label>Audio SRT <small>(optional: skips transcription; one SRT covering all audio files in order)</small> <input type="file" id="asrt" accept=".srt"></label>
-<label>OpenAI API key <small>(only needed without an audio SRT; stays in your browser)</small> <input type="password" id="key" size="40"></label>
+<label>OpenAI API key <small>(only for the Whisper option, or if you have no audio SRT; stays in your browser)</small> <input type="password" id="key" size="40"></label>
 </fieldset>
 <fieldset><legend>2. Settings</legend>
 <label>OCR language <input id="lang" value="eng" size="6"> &nbsp;OCR samples/sec <input type="number" id="sps" value="2" min="1" max="8"></label>
 <label>Min speed <input type="number" id="minS" value="0.6" step="0.1"> Max speed <input type="number" id="maxS" value="2" step="0.1"> (limits per scene)</label>
+<label>Audio timing <select id="tm"><option value="free">Free: detect pauses in the audio (recommended)</option><option value="whisper">Whisper (OpenAI key, about $0.006/min)</option><option value="srt">Use the SRT times as given</option></select> Pause level (dB) <input type="number" id="db" value="-35" style="width:60px"></label>
 <label>If a scene is still too short after slowing, fill with
 <select id="pad"><option value="freeze">frozen last frame</option><option value="black">blank screen</option><option value="image">my image</option></select>
 <input type="file" id="img" accept="image/*"></label>
