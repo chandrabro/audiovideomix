@@ -6,9 +6,15 @@ const $ = id => document.getElementById(id);
 const log = m => { $('log').textContent += m + '\n'; $('log').scrollTop = 1e9; };
 const esc = s => s.replace(/[&<>"]/g, c => '&#' + c.charCodeAt(0) + ';');
 const norm = t => t.toLowerCase().replace(/[^\p{L}\p{M}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
-let ff, segs = [], vinfo, atotal = 0, busy = false, ready = false, tail = [];
+let ff, segs = [], awords = [], vinfo, atotal = 0, busy = false, ready = false, tail = [];
 const fail = e => { log('ERROR: ' + (e && e.message ? e.message : String(e))); console.error(e); if (ff) { try { ff.terminate(); } catch {} ff = null; } };
 const run = async (f, a) => { tail = []; const c = await f.exec(a); if (c !== 0) throw new Error(`ffmpeg exit ${c}: ${tail.slice(-4).join(' | ')}`); };
+
+async function probe(f, name) {
+  tail = []; await f.exec(['-i', name]); // exits non-zero (no output file) but logs the duration
+  const m = tail.join(' ').match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
+  return m ? +m[1] * 3600 + +m[2] * 60 + +m[3] : 0;
+}
 
 async function mountVideo(file) {
   const f = await getFF();
@@ -130,23 +136,73 @@ async function transcribe(files) {
   return { words: j.words.map(w => ({ w: norm(w.word), s: w.start })).filter(x => x.w), total: j.duration };
 }
 
-// ---------- 3. Match each caption scene to its spoken words ----------
-function align(segs, words) {
-  let p = 0;
-  segs.forEach(s => {
-    const C = s.text.split(' '), n = C.length, cs = new Set(C);
-    let best = -1, bi = p;
-    for (let i = p; i < Math.min(words.length, p + 3 * n + 40); i++) {
-      let sc = 0;
-      for (let j = i; j < Math.min(words.length, i + n); j++) if (cs.has(words[j].w)) sc++;
-      if (sc > best) { best = sc; bi = i; }
+// ---------- 3. Match scenes to audio: global alignment of the two word sequences ----------
+// (tolerates extra sounds like "hahaha", missing words, small spelling differences)
+function dpAlign(V, A) {
+  const n = V.length, m = A.length, B = Math.max(150, Math.ceil(0.2 * Math.max(n, m))), W = 2 * B + 1;
+  const bg = w => { const s = new Set(); for (let i = 0; i < w.length - 1; i++) s.add(w.slice(i, i + 2)); return s; };
+  const bv = V.map(bg), ba = A.map(bg);
+  const score = (i, j) => {
+    if (V[i] === A[j]) return 3;
+    if (V[i][0] !== A[j][0] || Math.abs(V[i].length - A[j].length) > 3) return -2;
+    let c = 0; for (const g of bv[i]) if (ba[j].has(g)) c++;
+    return 2 * c / ((bv[i].size + ba[j].size) || 1) >= 0.6 ? 1.5 : -2;
+  };
+  const lo = i => Math.round(i * m / Math.max(n, 1)) - B, NEG = -1e9;
+  const tb = new Uint8Array((n + 1) * W);
+  let prev = new Float32Array(W).fill(NEG), cur = new Float32Array(W);
+  for (let i = 0; i <= n; i++) {
+    const L = lo(i), PL = i ? lo(i - 1) : 0;
+    for (let k = 0; k < W; k++) {
+      const j = L + k; let best = NEG, d = 0;
+      if (j < 0 || j > m) { cur[k] = NEG; continue; }
+      if (i === 0) { best = -j; d = 2; }
+      else {
+        const kd = j - 1 - PL, ku = j - PL;
+        if (j > 0 && kd >= 0 && kd < W && prev[kd] > NEG / 2) { const v = prev[kd] + score(i - 1, j - 1); if (v > best) { best = v; d = 0; } }
+        if (ku >= 0 && ku < W && prev[ku] > NEG / 2) { const v = prev[ku] - 1; if (v > best) { best = v; d = 1; } }
+        if (k > 0 && cur[k - 1] > NEG / 2) { const v = cur[k - 1] - 1; if (v > best) { best = v; d = 2; } }
+      }
+      cur[k] = best; tb[i * W + k] = d;
     }
-    s.conf = best / n;
-    s.as = words[Math.min(bi, words.length - 1)].s;
-    p = Math.min(bi + Math.max(1, Math.round(n * 0.7)), words.length - 1);
+    [prev, cur] = [cur, prev];
+  }
+  const map = new Array(n).fill(-1);
+  let i = n, j = m;
+  while (i > 0 || j > 0) {
+    const d = tb[i * W + (j - lo(i))];
+    if (i > 0 && j > 0 && d === 0) { if (score(i - 1, j - 1) > 0) map[i - 1] = j - 1; i--; j--; }
+    else if (i > 0 && (d === 1 || j === 0)) i--;
+    else j--;
+  }
+  return map; // map[videoWord] = audioWord index, or -1
+}
+
+function align(segs, words) {
+  const V = [], own = [], c0 = [];
+  segs.forEach((s, si) => { c0[si] = V.length; s.text.split(' ').forEach(w => { V.push(w); own.push(si); }); });
+  const map = dpAlign(V, words.map(x => x.w));
+  const n = segs.length, ai = new Array(n).fill(NaN), tot = new Array(n).fill(0), hit = new Array(n).fill(0);
+  V.forEach((_, vi) => {
+    const si = own[vi]; tot[si]++;
+    if (map[vi] >= 0) { hit[si]++; if (isNaN(ai[si])) ai[si] = Math.max(0, map[vi] - (vi - c0[si])); }
+  });
+  for (let i = 0; i < n; i++) if (isNaN(ai[i])) { // no matched word: interpolate between neighbours
+    let p = i - 1; while (p >= 0 && isNaN(ai[p])) p--;
+    let q = i + 1; while (q < n && isNaN(ai[q])) q++;
+    const [cp, ap] = p >= 0 ? [c0[p], ai[p]] : [0, 0];
+    const [cq, aq] = q < n ? [c0[q], ai[q]] : [V.length, words.length];
+    ai[i] = ap + (c0[i] - cp) / Math.max(cq - cp, 1) * (aq - ap);
+  }
+  let pv = 0;
+  segs.forEach((s, i) => {
+    ai[i] = Math.min(Math.max(ai[i], pv), words.length - 1); pv = ai[i];
+    s.ai = Math.round(ai[i]); s.as = words[s.ai].s; s.conf = tot[i] ? hit[i] / tot[i] : 0;
   });
   segs[0].as = 0;
-  for (let i = 1; i < segs.length; i++) segs[i].as = Math.max(segs[i].as, segs[i - 1].as + 0.2);
+  for (let i = 1; i < n; i++) segs[i].as = Math.max(segs[i].as, segs[i - 1].as + 0.3);
+  if (atotal > 0) for (let i = n - 1; i > 0; i--) segs[i].as = Math.min(segs[i].as, (segs[i + 1] ? segs[i + 1].as : atotal) - 0.3);
+  return hit.reduce((a, b) => a + b, 0) / Math.max(V.length, 1);
 }
 
 const aEnd = i => segs[i + 1] ? segs[i + 1].as : atotal;
@@ -155,10 +211,10 @@ const lim = () => [+$('minS').value, +$('maxS').value];
 function draw() {
   const [mn, mx] = lim();
   const num = (s, k, i) => `<td><input type=number step=0.05 value="${s[k].toFixed(2)}" data-k="${k}" data-i="${i}">`;
-  $('tbl').innerHTML = '<tr><th>#<th>Caption (OCR)<th>Video start<th>Video end<th>Audio start<th>Speed<th>Match</tr>' +
+  $('tbl').innerHTML = '<tr><th>#<th>Caption<th>Audio says (auto)<th>Video start<th>Video end<th>Audio start<th>Speed<th>Match</tr>' +
     segs.map((s, i) => {
       const f = (s.ve - s.vs) / Math.max(aEnd(i) - s.as, 0.1);
-      return `<tr><td>${i + 1}<td>${esc(s.text.slice(0, 60))}${num(s, 'vs', i)}${num(s, 've', i)}${num(s, 'as', i)}` +
+      return `<tr><td>${i + 1}<td>${esc(s.text.slice(0, 40))}<td>${esc(awords.slice(s.ai, s.ai + 6).map(x => x.w).join(' '))}${num(s, 'vs', i)}${num(s, 've', i)}${num(s, 'as', i)}` +
         `<td>${f.toFixed(2)}x${f < mn || f > mx ? ' ⚠' : ''}<td>${Math.round(s.conf * 100)}%${s.conf < .5 ? ' ⚠' : ''}</tr>`;
     }).join('');
 }
@@ -193,7 +249,9 @@ $('analyze').onclick = async () => {
       const tr = await transcribe(af); atotal = tr.total; words = tr.words;
     }
     if (!segs.length || !words.length) throw new Error('No captions or no spoken words found.');
-    align(segs, words); draw();
+    awords = words;
+    const frac = align(segs, words); draw();
+    log(`Matched ${Math.round(frac * 100)}% of caption words to the audio.` + (frac < 0.4 ? ' LOW: the two texts differ a lot, so check every ⚠ row.' : ''));
     ready = true; log('Review the table (fix anything marked ⚠), then Render.');
   } catch (e) { fail(e); }
 };
@@ -205,6 +263,9 @@ $('render').onclick = async () => {
     const w2 = w - (w % 2), h2 = h - (h % 2);
     const inp = await mountVideo($('video').files[0]);
     if (mode === 'image' && $('img').files[0]) await f.writeFile('img', await fetchFile($('img').files[0]));
+    log('Preparing audio…');
+    await buildAudio([...$('audio').files], ['-ar', '44100', '-ac', '2', '-b:a', '160k'], 'm4a', 'h');
+    const adur = await probe(f, 'h.m4a'); if (adur > 0) atotal = adur;
     const list = [];
     for (let i = 0; i < segs.length; i++) {
       const s = segs[i], vd = s.ve - s.vs, td = Math.max(aEnd(i) - s.as, 0.1);
@@ -225,9 +286,13 @@ $('render').onclick = async () => {
     }
     await f.writeFile('v.txt', list.map(n => `file '${n}'`).join('\n'));
     await run(f, ['-f', 'concat', '-safe', '0', '-i', 'v.txt', '-c', 'copy', 'video.mp4']);
-    log('Mixing audio…');
-    await buildAudio([...$('audio').files], ['-ar', '44100', '-ac', '2', '-b:a', '160k'], 'm4a', 'h');
-    await run(f, ['-i', 'video.mp4', '-i', 'h.m4a', '-map', '0:v', '-map', '1:a', '-c', 'copy', '-shortest', 'out.mp4']);
+    const vdur = await probe(f, 'video.mp4');
+    log(`Video ${vdur.toFixed(1)}s, audio ${atotal.toFixed(1)}s`);
+    const gap = atotal - vdur; // video ended early -> hold the last frame instead of black
+    await run(f, gap > 0.2
+      ? ['-i', 'video.mp4', '-i', 'h.m4a', '-map', '0:v', '-map', '1:a', '-vf', `tpad=stop_mode=clone:stop_duration=${gap}`,
+         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-shortest', 'out.mp4']
+      : ['-i', 'video.mp4', '-i', 'h.m4a', '-map', '0:v', '-map', '1:a', '-c', 'copy', '-shortest', 'out.mp4']);
     const url = URL.createObjectURL(new Blob([await f.readFile('out.mp4')], { type: 'video/mp4' }));
     for (const n of list) { try { await f.deleteFile(n); } catch {} }
     $('out').src = url; $('dl').href = url; log('Done.');
