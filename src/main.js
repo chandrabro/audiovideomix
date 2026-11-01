@@ -347,32 +347,44 @@ $('render').onclick = async () => {
     await buildAudio([...$('audio').files], ['-ar', '44100', '-ac', '2', '-b:a', '160k'], 'm4a', 'h');
     const adur = await probe(f, 'h.m4a'); if (adur > 0) atotal = adur;
     const list = [];
+    const fill = mode === 'image' && !$('img').files[0] ? 'freeze' : mode;
     for (let i = 0; i < segs.length; i++) {
-      const s = segs[i], vd = s.ve - s.vs, td = Math.max(aEnd(i) - s.as, 0.1);
-      const sp = Math.min(mx, Math.max(mn, vd / td)), got = vd / sp, gap = td - got;
+      const s = segs[i], vd = s.ve - s.vs;
+      // whole frames, so the scenes add up exactly to the audio length
+      const N = Math.max(1, Math.round(FPS * aEnd(i)) - Math.round(FPS * s.as)), td = N / FPS;
+      const sp = Math.min(mx, Math.max(mn, vd / td)), got = vd / sp, gap = td - got, pad = gap > 0.04;
+      const nMain = pad && fill === 'image' ? Math.max(1, Math.round(got * FPS)) : N;
       let vf = `setpts=PTS/${sp},fps=${FPS},scale=${w2}:${h2},setsar=1`;
-      if (gap > 0.04 && mode === 'freeze') vf += `,tpad=stop_mode=clone:stop_duration=${gap}`;
-      if (gap > 0.04 && mode === 'black') vf += `,tpad=stop_mode=add:stop_duration=${gap}:color=black`;
-      await run(f, ['-ss', String(s.vs), '-t', String(vd), '-i', inp, '-vf', vf, '-an', '-t', String(td),
+      if (pad && fill === 'freeze') vf += `,tpad=stop_mode=clone:stop_duration=${gap + 0.2}`;
+      if (pad && fill === 'black') vf += `,tpad=stop_mode=add:stop_duration=${gap + 0.2}:color=black`;
+      await run(f, ['-ss', String(s.vs), '-t', String(vd), '-i', inp, '-vf', vf, '-an', '-frames:v', String(nMain),
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-pix_fmt', 'yuv420p', '-r', String(FPS), `s${i}.mp4`]);
       list.push(`s${i}.mp4`);
-      if (gap > 0.04 && mode === 'image' && $('img').files[0]) {
-        await run(f, ['-loop', '1', '-i', 'img', '-t', String(gap), '-vf',
+      if (pad && fill === 'image' && N - nMain > 0) {
+        await run(f, ['-loop', '1', '-framerate', String(FPS), '-i', 'img', '-frames:v', String(N - nMain), '-vf',
           `scale=${w2}:${h2}:force_original_aspect_ratio=decrease,pad=${w2}:${h2}:(ow-iw)/2:(oh-ih)/2,fps=${FPS},setsar=1`,
-          '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', `p${i}.mp4`]);
+          '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-pix_fmt', 'yuv420p', `p${i}.mp4`]);
         list.push(`p${i}.mp4`);
       }
-      log(`Scene ${i + 1}/${segs.length}: ${sp.toFixed(2)}x${gap > 0.04 ? ', +' + gap.toFixed(1) + 's fill' : ''}`);
+      log(`Scene ${i + 1}/${segs.length}: ${sp.toFixed(2)}x${pad ? ', +' + gap.toFixed(1) + 's fill' : ''}`);
     }
+    log('Joining scenes…');
     await f.writeFile('v.txt', list.map(n => `file '${n}'`).join('\n'));
     await run(f, ['-f', 'concat', '-safe', '0', '-i', 'v.txt', '-c', 'copy', 'video.mp4']);
     const vdur = await probe(f, 'video.mp4');
     log(`Video ${vdur.toFixed(1)}s, audio ${atotal.toFixed(1)}s`);
-    const gap = atotal - vdur; // video ended early -> hold the last frame instead of black
-    await run(f, gap > 0.2
-      ? ['-i', 'video.mp4', '-i', 'h.m4a', '-map', '0:v', '-map', '1:a', '-vf', `tpad=stop_mode=clone:stop_duration=${gap}`,
-         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-shortest', 'out.mp4']
-      : ['-i', 'video.mp4', '-i', 'h.m4a', '-map', '0:v', '-map', '1:a', '-c', 'copy', '-shortest', 'out.mp4']);
+    let finalVideo = 'video.mp4';
+    const gap = atotal - vdur;
+    if (gap > 0.1) { // video ended early: hold the last frame (a tiny clip, no re-encode of the whole video)
+      await run(f, ['-sseof', '-0.05', '-i', 'video.mp4', '-vframes', '1', 'last.png']);
+      await run(f, ['-loop', '1', '-framerate', String(FPS), '-i', 'last.png', '-frames:v', String(Math.ceil(gap * FPS)),
+        '-vf', `scale=${w2}:${h2},fps=${FPS},setsar=1`, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-pix_fmt', 'yuv420p', 'tail.mp4']);
+      await f.writeFile('v2.txt', "file 'video.mp4'\nfile 'tail.mp4'");
+      await run(f, ['-f', 'concat', '-safe', '0', '-i', 'v2.txt', '-c', 'copy', 'video2.mp4']);
+      finalVideo = 'video2.mp4';
+    }
+    log('Adding audio…');
+    await run(f, ['-i', finalVideo, '-i', 'h.m4a', '-map', '0:v', '-map', '1:a', '-c', 'copy', '-shortest', 'out.mp4']);
     const url = URL.createObjectURL(new Blob([await f.readFile('out.mp4')], { type: 'video/mp4' }));
     for (const n of list) { try { await f.deleteFile(n); } catch {} }
     $('out').src = url; $('dl').href = url; log('Done.');
